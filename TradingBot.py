@@ -1,5 +1,5 @@
 '''
-Resample the stream tick snapshot data every 3 mins to 3m K
+Call signal module after every 3 mins resampling realtime bars and send bracket order if signal is true.
 '''
 from ibapi.client import EClient
 from ibapi.wrapper import EWrapper
@@ -11,6 +11,7 @@ import pandas as pd
 import threading
 import time
 from datetime import datetime
+from _SB import _SB
 
 class TestApp(EWrapper,EClient):
     def __init__(self):
@@ -30,6 +31,12 @@ class TestApp(EWrapper,EClient):
             }
         self.now_date=0
         self.pre_date=0
+
+        self.signal=False # For placing Bracket Order
+        self.qty=0
+        self.entryprice=0
+        self.tp=0
+        self.sl=0
         return
 
     def error(self,reqId,errorCode,errorString):
@@ -59,36 +66,94 @@ class TestApp(EWrapper,EClient):
         self.df1=self.df1.set_index('DateTime')
         self.pre_date=self.now_date #Calculate the bar.date and previous bar.date
         self.now_date=int(bar.date)
+
         if self.now_date != self.pre_date : #Resample once after the bar closed
             res_df=self.df1.resample('3min', closed='left', label='left').agg(self.res_dict)
             del self.data1[0:len(self.data1)-1]
             res_df.drop(res_df.index[-1], axis=0, inplace=True) #delete the new open bar at lastest appended row
             res_df.to_csv('/Users/davidliao/Documents/code/Github/MyProject/data/3K.csv', mode='a', header=False,float_format='%.5f')
             print('Resampled',datetime.fromtimestamp(self.now_date-60*self.period))
-        # self.df1.to_csv('/Users/davidliao/Documents/code/Github/MyProject/data/3K_HistoricalUpdate.csv' ,float_format='%.5f')
+            self.signal,self.qty,self.entryprice,self.tp,self.sl=_SB() # call calculation module to get entry sinal and price. can call _SB1 for test.
+            if self.signal != False:
+                self.start()
         return
 
     def nextValidId(self,orderId):
         self.nextOrderId=orderId
-        self.start()
         return
 
     def start(self):
-        order=Order()
-        order.action="SELL"
-        order.totalQuantity=90000
-        order.orderType="MKT"
+        contract = Contract() # Contract
+        contract.symbol = "EUR"
+        contract.secType = "CASH" 
+        contract.currency = "USD"
+        contract.exchange = "IDEALPRO" 
+
+        bracket = self.BracketOrder(self,self.nextOrderId, self.signal, self.qty, self.entryprice, self.tp, self.sl) # Order
+        for o in bracket:
+            self.placeOrder(o.orderId, contract, o)
+            self.nextOrderId # need to advance this we’ll skip one extra oid, it’s fine
+
+        #Update Portfolio
+        self.reqAccountUpdates(True,"") 
         return
 
     def stop(self):
         self.done=True
         self.disconnect()
         return
+    
+    @staticmethod
+    def BracketOrder(self,
+        parentOrderId, #OrderId
+        action,  #'BUY' or 'SELL'
+        quantity,  #quantity of order
+        limitPrice,  # Entry Price
+        takeProfitLimitPrice,  # Exit price
+        stopLossPrice # Stop-loss price
+        ):
+
+        #This will be our main or “parent” order
+        parent = Order()
+        parent.orderId = parentOrderId
+        parent.action = action
+        parent.orderType = 'LMT'
+        parent.totalQuantity = quantity
+        parent.lmtPrice = limitPrice
+        #The parent and children orders will need this attribute set to False to prevent accidental executions.
+        #The LAST CHILD will have it set to True, 
+        parent.transmit = False
+
+        takeProfit = Order()
+        takeProfit.orderId = parent.orderId + 1
+        takeProfit.action = 'SELL' if action == 'BUY' else 'BUY'
+        takeProfit.orderType = 'LMT'
+        takeProfit.totalQuantity = quantity
+        takeProfit.lmtPrice = takeProfitLimitPrice
+        takeProfit.parentId = parentOrderId
+        takeProfit.transmit = False
+
+        stopLoss = Order()
+        stopLoss.orderId = parent.orderId + 2
+        stopLoss.action = 'SELL' if action == 'BUY' else 'BUY'
+        stopLoss.orderType = 'STP'
+        #Stop trigger price
+        stopLoss.auxPrice = stopLossPrice
+        stopLoss.totalQuantity = quantity
+        stopLoss.parentId = parentOrderId
+        #In this case, the low side order will be the last child being sent. Therefore, it needs to set this attribute to True 
+        #to activate all its predecessors
+        stopLoss.transmit = True
+
+        bracketOrder = [parent, takeProfit, stopLoss]
+        print('Parent.TP,SL OrderId:',parent.orderId,takeProfit.orderId,stopLoss.orderId)
+        return bracketOrder
 
 def main():
     app=TestApp()
     app.nextOrderId=0
-    app.connect('127.0.0.1',4002,0)
+    app.connect('127.0.0.1',7497,0) # IB TWS
+    # app.connect('127.0.0.1',4002,0) # IB Gateway
     
     contract = Contract()
     contract.symbol = "EUR"
@@ -98,10 +163,7 @@ def main():
 
     #request historical data
     app.reqHistoricalData(1,contract,'','2 D','3 mins','MIDPOINT',0,2,True,[])
-
-    # Call stop() after 3 seconds to disconnect the program
-    Timer(1500,app.stop).start()
-   
+    
     app.run()
 
 if __name__=="__main__":
